@@ -1,0 +1,4 @@
+[Desktop Entry]
+Type=Application
+Name=KAVRION Bienvenue
+Exec=sh -c "grep -qw boot=live /proc/cmdline && exec xfce4-terminal --maximize --hide-menubar -x sudo kavrion-install --welcome"

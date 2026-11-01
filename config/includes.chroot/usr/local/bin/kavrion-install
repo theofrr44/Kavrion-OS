@@ -1,0 +1,217 @@
+#!/bin/bash
+# KAVRION OS - installateur simple (session Live uniquement).
+# Étapes : choix du disque -> compte -> confirmation "EFFACER" -> partitionnement -> copie -> GRUB (UEFI ou BIOS).
+# Mode simulation : KAVRION_DRY=1 (journalise les commandes sans les exécuter).
+# Mode non interactif (tests) : KAVRION_NONINTERACTIVE=1 KAVRION_DISK KAVRION_USER KAVRION_PASSWORD KAVRION_CONFIRM=EFFACER
+set -uo pipefail
+LOG="${KAVRION_LOG:-/var/log/kavrion-install.log}"
+TARGET=/target
+SQUASH="${KAVRION_SQUASH:-/run/live/medium/live/filesystem.squashfs}"
+DRY="${KAVRION_DRY:-0}"
+NONINT="${KAVRION_NONINTERACTIVE:-0}"
+TITLE="Installation de KAVRION OS"
+MIN_BYTES=$((8 * 1024 * 1024 * 1024))
+
+say() { echo "[$(date +%T)] $*" >>"$LOG"; }
+run() { say "+ $*"; [ "$DRY" = 1 ] && return 0; "$@" >>"$LOG" 2>&1; }
+runin() { say "+ (chroot) $*"; [ "$DRY" = 1 ] && return 0; chroot "$TARGET" "$@" >>"$LOG" 2>&1; }
+put() { say "écriture de $1"; if [ "$DRY" = 1 ]; then cat >/dev/null; else cat >"$1"; fi; }
+step() { say "== $1"; if [ "$NONINT" = 1 ]; then echo "[étape] $1"; else whiptail --title "$TITLE" --infobox "$1" 8 70; fi; }
+
+cleanup() { [ "$DRY" = 1 ] && return 0; sync; umount -R "$TARGET" 2>/dev/null || true; }
+
+die() {
+  say "ERREUR : $*"; cleanup
+  if [ "$NONINT" = 1 ]; then echo "ERREUR : $*" >&2; exit 1; fi
+  whiptail --title "$TITLE - ÉCHEC" --scrolltext --msgbox "L'installation a échoué :\n$*\n\nDernières lignes du journal ($LOG) :\n$(tail -n 12 "$LOG")\n\nPrenez cet écran en photo et envoyez-le." 24 78
+  read -rp "Appuyez sur Entrée pour fermer." _
+  exit 1
+}
+
+part() { case "$1" in *[0-9]) echo "${1}p$2" ;; *) echo "${1}$2" ;; esac; }
+valid_user() { [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]] && [ "$1" != root ]; }
+
+live_disk() {  # disque qui contient la clé Live (jamais proposé à l'effacement)
+  local src pk
+  src=$(findmnt -no SOURCE /run/live/medium 2>/dev/null) || return 0
+  [ -n "$src" ] || return 0
+  pk=$(lsblk -no PKNAME "$src" 2>/dev/null | head -n1)
+  if [ -n "$pk" ]; then echo "/dev/$pk"; else echo "$src"; fi
+}
+
+list_disks() {  # lignes "chemin|taille|modèle"
+  local live n sz model
+  live=$(live_disk)
+  while read -r n; do
+    case "$n" in /dev/loop* | /dev/ram* | /dev/zram* | /dev/sr* | /dev/nbd* | /dev/fd*) continue ;; esac
+    [ "$n" = "$live" ] && continue
+    sz=$(lsblk -bdno SIZE "$n" 2>/dev/null) || continue
+    [ "${sz:-0}" -ge "$MIN_BYTES" ] || continue
+    model=$(lsblk -dno MODEL "$n" 2>/dev/null | sed 's/ *$//')
+    echo "$n|$(numfmt --to=iec --suffix=B "$sz")|${model:-disque}"
+  done < <(lsblk -dpno NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}')
+}
+
+validate_disk() {  # refuse la clé Live ; hors simulation, exige un disque listé
+  local d="$1" live
+  [ -n "$d" ] || return 1
+  live=$(live_disk)
+  [ "$d" != "$live" ] || return 1
+  [ "$DRY" = 1 ] && return 0
+  list_disks | grep -q "^$d|"
+}
+
+is_uefi() { case "${KAVRION_FIRMWARE:-auto}" in uefi) return 0 ;; bios) return 1 ;; *) [ -d /sys/firmware/efi ] ;; esac; }
+
+do_install() {
+  local D="$1" U="$2" P="$3" EFI ROOT EFIU ROOTU g groups=""
+  EFI=$(part "$D" 2); ROOT=$(part "$D" 3)
+  [ "$DRY" = 1 ] || [ -f "$SQUASH" ] || die "Système introuvable : $SQUASH (la clé USB a-t-elle été retirée ?)"
+
+  step "1/6 Préparation du disque $D…"
+  if [ "$DRY" != 1 ]; then
+    for p in $(lsblk -lnpo NAME "$D" | tail -n +2); do swapoff "$p" 2>/dev/null; umount -R "$p" 2>/dev/null; done
+  fi
+  run wipefs -a "$D" || die "Impossible d'effacer la table de partitions de $D"
+  say "+ sfdisk (GPT : 1 MiB BIOS-boot, 512 MiB EFI, reste en ext4) sur $D"
+  if [ "$DRY" != 1 ]; then
+    printf 'label: gpt\n,1MiB,21686148-6449-6E6F-744E-656564454649\n,512MiB,C12A7328-F81F-11D2-BA4B-00A0C93EC93B\n,,0FC63DAF-8483-4772-8E79-3D69D8477DE4\n' \
+      | sfdisk --wipe always "$D" >>"$LOG" 2>&1 || die "Partitionnement de $D impossible"
+    partprobe "$D" >>"$LOG" 2>&1; udevadm settle >>"$LOG" 2>&1
+    for _ in $(seq 1 30); do [ -b "$ROOT" ] && [ -b "$EFI" ] && break; sleep 0.5; done
+    [ -b "$ROOT" ] || die "La partition $ROOT n'est pas apparue"
+  fi
+  run mkfs.fat -F32 -n KAVRION_EFI "$EFI" || die "Formatage EFI impossible"
+  run mkfs.ext4 -F -q -L KAVRION "$ROOT" || die "Formatage ext4 impossible"
+  run mkdir -p "$TARGET"
+  run mount "$ROOT" "$TARGET" || die "Montage de la racine impossible"
+  run mkdir -p "$TARGET/boot/efi"
+  run mount "$EFI" "$TARGET/boot/efi" || die "Montage de la partition EFI impossible"
+
+  step "2/6 Copie du système (quelques minutes)…"
+  if [ "$DRY" = 1 ]; then say "+ unsquashfs -f -d $TARGET $SQUASH"
+  elif [ "$NONINT" = 1 ]; then unsquashfs -f -q -d "$TARGET" "$SQUASH" >>"$LOG" 2>&1 || die "Copie du système échouée"
+  else
+    say "+ unsquashfs -f -percentage -d $TARGET $SQUASH"
+    unsquashfs -f -percentage -d "$TARGET" "$SQUASH" 2>>"$LOG" | grep --line-buffered -E '^[0-9]+$' | whiptail --title "$TITLE" --gauge "Copie du système…" 8 70 0
+    [ "${PIPESTATUS[0]}" -eq 0 ] || die "Copie du système échouée"
+  fi
+  [ "$DRY" = 1 ] || [ -x "$TARGET/usr/bin/systemctl" ] || die "Copie incomplète (systemctl absent)"
+
+  step "3/6 Configuration du système…"
+  run rm -f "$TARGET/etc/lightdm/lightdm.conf.d/50-kavrion-live.conf" "$TARGET/etc/skel/Desktop/kavrion-install.desktop" \
+    "$TARGET/usr/share/applications/kavrion-install.desktop" "$TARGET/etc/xdg/autostart/kavrion-welcome.desktop" \
+    "$TARGET/usr/local/bin/kavrion-install" "$TARGET/etc/sudoers.d/live"
+  if [ "$DRY" = 1 ]; then ROOTU=ROOT-UUID; EFIU=EFI-UUID; else ROOTU=$(blkid -s UUID -o value "$ROOT"); EFIU=$(blkid -s UUID -o value "$EFI"); fi
+  put "$TARGET/etc/fstab" <<EOT
+UUID=$ROOTU / ext4 defaults,noatime,errors=remount-ro 0 1
+UUID=$EFIU /boot/efi vfat umask=0077 0 2
+EOT
+  echo kavrion | put "$TARGET/etc/hostname"
+  put "$TARGET/etc/hosts" <<EOT
+127.0.0.1 localhost
+127.0.1.1 kavrion
+::1 localhost ip6-localhost ip6-loopback
+EOT
+  : | put "$TARGET/etc/machine-id"
+  run rm -f "$TARGET/var/lib/dbus/machine-id"
+  put "$TARGET/etc/default/grub" <<'EOT'
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=3
+GRUB_DISTRIBUTOR="KAVRION OS"
+GRUB_CMDLINE_LINUX_DEFAULT="quiet"
+GRUB_CMDLINE_LINUX=""
+GRUB_DISABLE_OS_PROBER=false
+EOT
+  for d in dev dev/pts proc sys run; do run mount --bind "/$d" "$TARGET/$d" || die "Montage de /$d impossible"; done
+  if is_uefi; then run mount -t efivarfs efivarfs "$TARGET/sys/firmware/efi/efivars" || say "efivarfs non monté (pas bloquant)"; fi
+
+  step "4/6 Création du compte « $U »…"
+  for g in sudo audio video plugdev netdev cdrom users; do
+    if [ "$DRY" = 1 ] || grep -q "^$g:" "$TARGET/etc/group"; then groups="$groups$g,"; fi
+  done
+  runin useradd -m -s /bin/bash -G "${groups%,}" "$U" || die "Création du compte impossible"
+  say "+ chpasswd (mot de passe non journalisé)"
+  if [ "$DRY" != 1 ]; then printf '%s:%s\n' "$U" "$P" | chroot "$TARGET" chpasswd >>"$LOG" 2>&1 || die "Définition du mot de passe impossible"; fi
+  runin passwd -l root || say "root déjà verrouillé"
+
+  step "5/6 Nettoyage des composants Live et initramfs…"
+  runin env DEBIAN_FRONTEND=noninteractive apt-get -y purge live-boot live-boot-initramfs-tools live-config live-config-systemd || say "purge Live partielle (non bloquant)"
+  run rm -rf "$TARGET/etc/live"
+  runin update-initramfs -u -k all || die "Génération de l'initramfs impossible"
+
+  step "6/6 Installation du chargeur de démarrage (GRUB)…"
+  if is_uefi; then
+    runin grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=KAVRION --removable --no-nvram --recheck || die "GRUB (UEFI, chemin de repli) a échoué"
+    runin grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=KAVRION --recheck || say "Entrée NVRAM non créée (courant) : démarrage par le chemin de repli EFI/BOOT"
+  else
+    runin grub-install --target=i386-pc --recheck "$D" || die "GRUB (BIOS) a échoué"
+  fi
+  runin update-grub || die "update-grub a échoué"
+  if [ "$DRY" != 1 ]; then
+    grep -q vmlinuz "$TARGET/boot/grub/grub.cfg" 2>/dev/null || die "grub.cfg sans noyau : le système ne démarrerait pas"
+    if is_uefi; then ls "$TARGET/boot/efi/EFI/BOOT/" 2>/dev/null | grep -qi 'bootx64.efi' || die "BOOTX64.EFI absent de la partition EFI"; fi
+    cp "$LOG" "$TARGET/var/log/kavrion-install.log" 2>/dev/null
+  fi
+  cleanup
+  say "INSTALLATION TERMINÉE"
+}
+
+ask() { whiptail --title "$TITLE" "$@" 3>&1 1>&2 2>&3; }
+
+main() {
+  [ "$(id -u)" -eq 0 ] || exec sudo "$0" "$@"
+  [ "$DRY" = 1 ] || grep -qw 'boot=live' /proc/cmdline || { echo "Cet installateur ne fonctionne que depuis la clé Live KAVRION."; exit 1; }
+  mkdir -p "$(dirname "$LOG")"; : >>"$LOG"
+  local D U P P2 line n size model CONF items=()
+
+  if [ "$NONINT" = 1 ]; then
+    D="${KAVRION_DISK:?KAVRION_DISK requis}"; U="${KAVRION_USER:?}"; P="${KAVRION_PASSWORD:?}"
+    [ "${KAVRION_CONFIRM:-}" = "EFFACER" ] || { echo "Confirmation EFFACER absente : abandon." >&2; exit 1; }
+    valid_user "$U" || { echo "Nom d'utilisateur invalide." >&2; exit 1; }
+    [ "${#P}" -ge 8 ] || { echo "Mot de passe trop court (8 minimum)." >&2; exit 1; }
+    validate_disk "$D" || { echo "Disque refusé (clé Live ou disque non listé) : $D" >&2; exit 1; }
+    do_install "$D" "$U" "$P"; echo "Installation terminée."; exit 0
+  fi
+
+  if [ "${1:-}" = "--welcome" ]; then
+    case "$(ask --menu "Bienvenue dans KAVRION OS.\nQue voulez-vous faire ?" 15 70 3 \
+      install "Installer KAVRION OS sur cet ordinateur" \
+      live "Essayer KAVRION OS sans rien installer" \
+      off "Éteindre l'ordinateur")" in
+      install) ;;
+      off) systemctl poweroff; exit 0 ;;
+      *) exit 0 ;;
+    esac
+  fi
+
+  while read -r line; do
+    n=${line%%|*}; size=$(echo "$line" | cut -d'|' -f2); model=$(echo "$line" | cut -d'|' -f3)
+    items+=("$n" "$size  $model")
+  done < <(list_disks)
+  [ "${#items[@]}" -gt 0 ] || { whiptail --title "$TITLE" --msgbox "Aucun disque interne d'au moins 8 Go n'a été trouvé (la clé Live est exclue)." 9 70; exit 1; }
+  D=$(ask --menu "Sur quel disque installer KAVRION OS ?\n\nATTENTION : le disque choisi sera ENTIÈREMENT effacé.\nLes autres disques ne sont pas touchés." 20 76 8 "${items[@]}") || exit 0
+  validate_disk "$D" || { whiptail --msgbox "Disque refusé : $D" 8 50; exit 1; }
+
+  while :; do
+    U=$(ask --inputbox "Nom d'utilisateur (minuscules, chiffres, - et _ ; pas « root ») :" 10 70 "") || exit 0
+    valid_user "$U" && break
+    whiptail --msgbox "Nom invalide. Exemple : marc" 8 50
+  done
+  while :; do
+    P=$(ask --passwordbox "Choisissez VOTRE mot de passe (8 caractères minimum).\nAucun mot de passe n'est fourni avec KAVRION OS." 11 70) || exit 0
+    P2=$(ask --passwordbox "Retapez le mot de passe :" 9 70) || exit 0
+    [ "$P" = "$P2" ] && [ "${#P}" -ge 8 ] && break
+    whiptail --msgbox "Les mots de passe diffèrent ou sont trop courts (8 minimum)." 8 60
+  done
+
+  whiptail --title "Contenu ACTUEL de $D" --scrolltext --msgbox "$(lsblk -o NAME,SIZE,FSTYPE,LABEL "$D" 2>&1)\n\nTout ceci va être détruit à l'étape suivante." 20 78
+  CONF=$(ask --inputbox "DERNIÈRE CONFIRMATION\n\nTOUT le contenu de $D sera DÉFINITIVEMENT EFFACÉ (Windows, fichiers, etc. s'ils s'y trouvent).\nPour continuer, tapez EFFACER en majuscules. Sinon, annulez." 14 76 "") || exit 0
+  [ "$CONF" = "EFFACER" ] || { whiptail --msgbox "Confirmation non reçue : rien n'a été modifié." 8 60; exit 0; }
+
+  do_install "$D" "$U" "$P"
+  whiptail --title "$TITLE" --msgbox "Installation terminée !\n\nRetirez la clé USB, puis validez : l'ordinateur va redémarrer sur KAVRION OS." 10 70
+  systemctl reboot
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

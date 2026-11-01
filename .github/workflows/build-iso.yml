@@ -1,0 +1,31 @@
+name: Construire l'ISO KAVRION OS
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    container:
+      image: debian:trixie
+      options: --privileged
+    steps:
+      - name: Dépendances de base
+        run: apt-get update && apt-get install -y git ca-certificates python3 python3-yaml util-linux coreutils
+      - uses: actions/checkout@v4
+      - name: Tests (informatifs)
+        continue-on-error: true
+        run: python3 tests/test_sysinfo.py && bash tests/test_installer.sh && bash tests/check_repo.sh
+      - name: Construire l'ISO
+        run: bash scripts/build.sh --install-deps
+      - name: Vérifier l'ISO (informatif)
+        continue-on-error: true
+        run: bash scripts/verify-iso.sh dist/kavrion-os-$(cat VERSION)-amd64.iso
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kavrion-os-iso
+          path: |
+            dist/*.iso
+            dist/*.sha256
+            dist/BUILD-INFO.txt
+            dist/*.log
