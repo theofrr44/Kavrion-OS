@@ -63,10 +63,26 @@ validate_disk() {  # refuse la clé Live ; hors simulation, exige un disque list
 
 is_uefi() { case "${KAVRION_FIRMWARE:-auto}" in uefi) return 0 ;; bios) return 1 ;; *) [ -d /sys/firmware/efi ] ;; esac; }
 
+verify_source() {  # lit toute l'image système AVANT toute modification du disque
+  local dir
+  [ "$DRY" = 1 ] && { say "+ vérification de la clé USB (simulée)"; return 0; }
+  dir=$(dirname "$(dirname "$SQUASH")")
+  if [ -f "$dir/md5sum.txt" ] && grep -q 'live/filesystem.squashfs' "$dir/md5sum.txt"; then
+    say "+ md5sum -c (filesystem.squashfs)"
+    ( cd "$dir" && grep 'live/filesystem.squashfs' md5sum.txt | md5sum -c - ) >>"$LOG" 2>&1
+  else
+    say "+ lecture complète de $SQUASH (pas de md5sum.txt)"
+    dd if="$SQUASH" of=/dev/null bs=4M >>"$LOG" 2>&1
+  fi
+}
+
 do_install() {
   local D="$1" U="$2" P="$3" EFI ROOT EFIU ROOTU g groups=""
   EFI=$(part "$D" 2); ROOT=$(part "$D" 3)
   [ "$DRY" = 1 ] || [ -f "$SQUASH" ] || die "Système introuvable : $SQUASH (la clé USB a-t-elle été retirée ?)"
+
+   step "0/6 Vérification de la clé USB (1 à 3 minutes, rien n'est encore modifié)…"
+  verify_source || die "La clé USB est illisible ou corrompue (erreurs de lecture). RIEN n'a été modifié sur votre disque. Essayez un autre port USB (de préférence USB 2.0), refaites la clé avec Rufus (option « Vérifier les blocs défectueux »), ou utilisez une autre clé."
 
   step "1/6 Préparation du disque $D…"
   if [ "$DRY" != 1 ]; then
